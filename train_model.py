@@ -10,7 +10,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-
+from bs4 import BeautifulSoup
 # ----------- Reproducibility -----------
 random.seed(42); np.random.seed(42); tf.random.set_seed(42)
 
@@ -23,7 +23,12 @@ OUT_MODEL   = Path("model.tflite")
 OUT_VERSION = Path("version.json")
 
 UA = {"User-Agent": "Mozilla/5.0 (XSMB-TrainingBot/2.0)"}
-
+def make_soup(html: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        # Fallback nếu lxml không có
+        return BeautifulSoup(html, "html.parser")
 # ========== Utils ==========
 
 def fetch_html(url, retries=5, timeout=20):
@@ -122,7 +127,7 @@ def scrape_days(target=90):
     # 1) 30-day page
     try:
         html = fetch_html(BASE_URL_30)
-        soup = BeautifulSoup(html, "lxml")
+        soup = make_soup(html)
         out.extend(parse_from_soup(soup))
     except Exception as e:
         print("[scrape] 30-day page failed:", e)
@@ -141,7 +146,7 @@ def scrape_days(target=90):
             url = DAY_URL_FMT.format(dd=dd, mm=mm, yyyy=yyyy)
             try:
                 html = fetch_html(url)
-                soup = BeautifulSoup(html, "lxml")
+                soup = make_soup(html)
                 got = parse_from_soup(soup)
                 if got:
                     out.extend(got)
@@ -241,3 +246,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
