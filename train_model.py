@@ -164,15 +164,19 @@ def main():
         print("Not enough data scraped (<20). Abort."); sys.exit(1)
 
     days = list(reversed(raw))          # oldest -> newest
-    X, y = make_supervised(days, win=7)
+    X, y = make_supervised(days, win=7) # y shape (N,2)
+
+    # >>> NEW: mở rộng nhãn (N,2) -> (N,20) bằng cách lặp lại 10 lần
+    y20 = np.concatenate([y] * 10, axis=1)
+
     if len(X) < 30:
         print("Not enough supervised samples (<30). Abort."); sys.exit(1)
 
-    print(f"[dataset] X:{X.shape} y:{y.shape}")  # X:(N,378) y:(N,2)
+    print(f"[dataset] X:{X.shape} y:{y.shape} -> y20:{y20.shape}")  # ví dụ: y20:(N,20)
 
-    model = build_model(X.shape[1])
+    model = build_model(X.shape[1])     # output 20
     cb = keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)
-    model.fit(X, y, validation_split=0.15,
+    model.fit(X, y20, validation_split=0.15,
               epochs=120, batch_size=64, verbose=0, callbacks=[cb])
 
     export_tflite(model)
@@ -187,3 +191,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
