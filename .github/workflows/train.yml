@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "numpy==1.26.4"
           pip install --no-cache-dir "tensorflow-cpu==2.14.0"
-          pip install --no-cache-dir requests beautifulsoup4
+          pip install --no-cache-dir requests beautifulsoup4 lxml
 
       - name: Show versions
         run: |
