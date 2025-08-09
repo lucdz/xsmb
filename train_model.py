@@ -38,29 +38,20 @@ def last2(s: str) -> str:
     return digits[-2:]  # only last-2
 
 def parse_one_table(tbl) -> dict:
-    """
-    Return dict with keys:
-      - 'all_last2': list[str] length 27 (last-2 of all prizes, in table order)
-      - 'gdb_last2': str (last-2 of special prize)
-    If not enough numbers, return None.
-    """
     all_last2 = []
     gdb_last2 = None
 
-    # Duyệt từng hàng theo đúng thứ tự hiển thị
     for tr in tbl.select("tbody > tr"):
         tds = tr.find_all("td")
         if len(tds) < 2: continue
         key = tds[0].get_text(strip=True).lower()
 
-        # lấy toàn bộ span ở cột kết quả
         vals = [sp.get_text(strip=True) for sp in tds[1].select("span")]
         for v in vals:
             l2 = last2(v)
             if l2 is not None:
                 all_last2.append(l2)
 
-        # xác định GĐB để lấy nhãn
         if "mã" not in key and (
             "g.đb" in key or "g đb" in key or "giải đặc biệt" in key
             or "gdb" in key or re.search(r"g\s*\.\s*đb", key)
@@ -69,21 +60,20 @@ def parse_one_table(tbl) -> dict:
                 g = last2(vals[0])
                 if g: gdb_last2 = g
 
-    # Chuẩn hoá: cần đúng 27 số cho XSMB (nếu thừa lấy 27 đầu; thiếu thì bỏ)
-    if gdb_last2 is None: 
+    if gdb_last2 is None:
         return None
+
+    # Chuẩn hoá về đúng 27 số: thiếu thì pad "00", thừa thì cắt
+    if len(all_last2) < 20:
+        return None  # quá thiếu → bỏ
     if len(all_last2) < 27:
-        return None
-    if len(all_last2) > 27:
+        all_last2 = all_last2 + (["00"] * (27 - len(all_last2)))
+    elif len(all_last2) > 27:
         all_last2 = all_last2[:27]
 
     return {"all_last2": all_last2, "gdb_last2": gdb_last2}
 
 def scrape_days(n=400):
-    """
-    Trả về danh sách ngày (mới -> cũ):
-      [{'all_last2': [27 strings], 'gdb_last2': 'xy'}, ...]
-    """
     html = fetch_html(BASE_URL)
     soup = BeautifulSoup(html, "html.parser")
     out = []
@@ -92,7 +82,9 @@ def scrape_days(n=400):
         tbl = blk.select_one("table.table-xsmb")
         if not tbl: continue
         parsed = parse_one_table(tbl)
-        if parsed: out.append(parsed)
+        if parsed:
+            out.append(parsed)
+    print(f"[scrape] got {len(out)} days")
     return out
 
 # -------- dataset building --------
@@ -148,22 +140,21 @@ def sha256(p: Path) -> str:
 
 def main():
     raw = scrape_days(400)              # newest -> oldest
-    if len(raw) < 40:
-        print("Not enough data scraped"); sys.exit(1)
+    if len(raw) < 15:
+        print("Not enough data scraped (<15). Abort.")
+        sys.exit(1)
 
-    # chuyển thành oldest->newest cho sliding
     days = list(reversed(raw))
+    X, y = make_supervised(days, win=7)
+    if len(X) < 10:
+        print("Not enough supervised samples (<10). Abort.")
+        sys.exit(1)
 
-    X, y = make_supervised(days, win=7)  # win=7 days context
-    n = len(X)
-    idx = np.arange(n); np.random.shuffle(idx)
-    split = int(n * 0.85)
-    tr, va = idx[:split], idx[split:]
-    Xtr, ytr, Xva, yva = X[tr], y[tr], X[va], y[va]
+    print(f"[dataset] X:{X.shape} y:{y.shape}")
 
-    model = build_model(X.shape[1])     # 7*54 = 378
+    model = build_model(X.shape[1])     # 378
     cb = keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)
-    model.fit(Xtr, ytr, validation_data=(Xva, yva),
+    model.fit(X, y, validation_split=0.15,
               epochs=120, batch_size=64, verbose=0, callbacks=[cb])
 
     export_tflite(model)
@@ -178,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
