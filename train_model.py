@@ -1,4 +1,6 @@
-# train_model.py (compact better-baseline)
+# train_model.py — predict last-2 digits of special prize (GĐB)
+# using 27 last-2 digits from ALL prizes (XSMB) for the past 7 days.
+
 import re, json, hashlib, datetime, sys, time, random
 from pathlib import Path
 
@@ -15,64 +17,125 @@ BASE_URL = "https://xosodaiphat.com/xsmb-xo-so-mien-bac.html"
 OUT_MODEL = Path("model.tflite")
 OUT_VERSION = Path("version.json")
 
-UA = {"User-Agent": "Mozilla/5.0 (XSMB-TrainingBot/1.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (XSMB-TrainingBot/2.0)"}
 
 def fetch_html(url, retries=5, timeout=20):
     last = None
     for i in range(retries):
         try:
             r = requests.get(url, headers=UA, timeout=timeout)
-            r.raise_for_status(); return r.text
+            r.raise_for_status()
+            return r.text
         except Exception as e:
             last = e; time.sleep(2**i)
     raise last
 
-def scrape(n=400):
-    """Return list of 5-digit strings newest -> oldest."""
+# -------- scraping helpers --------
+
+def last2(s: str) -> str:
+    digits = re.sub(r"\D", "", s)
+    if len(digits) < 2: return None
+    return digits[-2:]  # only last-2
+
+def parse_one_table(tbl) -> dict:
+    """
+    Return dict with keys:
+      - 'all_last2': list[str] length 27 (last-2 of all prizes, in table order)
+      - 'gdb_last2': str (last-2 of special prize)
+    If not enough numbers, return None.
+    """
+    all_last2 = []
+    gdb_last2 = None
+
+    # Duyệt từng hàng theo đúng thứ tự hiển thị
+    for tr in tbl.select("tbody > tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2: continue
+        key = tds[0].get_text(strip=True).lower()
+
+        # lấy toàn bộ span ở cột kết quả
+        vals = [sp.get_text(strip=True) for sp in tds[1].select("span")]
+        for v in vals:
+            l2 = last2(v)
+            if l2 is not None:
+                all_last2.append(l2)
+
+        # xác định GĐB để lấy nhãn
+        if "mã" not in key and (
+            "g.đb" in key or "g đb" in key or "giải đặc biệt" in key
+            or "gdb" in key or re.search(r"g\s*\.\s*đb", key)
+        ):
+            if vals:
+                g = last2(vals[0])
+                if g: gdb_last2 = g
+
+    # Chuẩn hoá: cần đúng 27 số cho XSMB (nếu thừa lấy 27 đầu; thiếu thì bỏ)
+    if gdb_last2 is None: 
+        return None
+    if len(all_last2) < 27:
+        return None
+    if len(all_last2) > 27:
+        all_last2 = all_last2[:27]
+
+    return {"all_last2": all_last2, "gdb_last2": gdb_last2}
+
+def scrape_days(n=400):
+    """
+    Trả về danh sách ngày (mới -> cũ):
+      [{'all_last2': [27 strings], 'gdb_last2': 'xy'}, ...]
+    """
     html = fetch_html(BASE_URL)
     soup = BeautifulSoup(html, "html.parser")
     out = []
     for blk in soup.select('div[id^="kqngay_"]'):
         if len(out) >= n: break
-        tbl = blk.select_one("table.table-xsmb"); 
+        tbl = blk.select_one("table.table-xsmb")
         if not tbl: continue
-        gdb = None
-        for tr in tbl.select("tbody > tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 2: continue
-            key = tds[0].get_text(strip=True).lower()
-            if "mã" in key: continue
-            if "g.đb" in key or "g đb" in key or "giải đặc biệt" in key or "gdb" in key or re.search(r"g\s*\.\s*đb", key):
-                spans = [s.get_text(strip=True) for s in tds[1].select("span")]
-                if spans:
-                    digits = re.sub(r"\D","", spans[0])[-5:]
-                    if len(digits)==5: gdb = digits
-                break
-        if gdb: out.append(gdb)
-    return out  # newest -> oldest
+        parsed = parse_one_table(tbl)
+        if parsed: out.append(parsed)
+    return out
 
-def make_supervised(series, win=7):
-    """series: newest->oldest  -> build sliding windows."""
-    # reverse to oldest->newest cho dễ trượt
-    seq = list(reversed(series))
+# -------- dataset building --------
+
+def digits_to_vector(two_digits: str) -> np.ndarray:
+    # two digits "xy" -> [x, y] scaled /9
+    return np.array([int(two_digits[0]), int(two_digits[1])], dtype=np.float32) / 9.0
+
+def day_to_vector_54(all_last2: list[str]) -> np.ndarray:
+    """
+    27 numbers, each 2 digits -> 54 digits vector (0..9), scaled /9
+    Order stays as parsed.
+    """
+    arr = []
+    for s in all_last2:
+        arr.append(int(s[0])); arr.append(int(s[1]))
+    return np.array(arr, dtype=np.float32) / 9.0  # shape (54,)
+
+def make_supervised(days, win=7):
+    """
+    days: oldest->newest expected for sliding window.
+    X: shape [samples, win*54] ; y: shape [samples, 2]
+    """
     X, y = [], []
-    for i in range(len(seq) - win):
-        past = seq[i:i+win]      # win days
-        nxt  = seq[i+win]        # next day
-        X.append([int(c) for day in past for c in day])  # win*5 digits
-        y.append([int(c) for c in nxt])
-    X = np.array(X, dtype=np.float32) / 9.0
-    y = np.array(y, dtype=np.float32) / 9.0
-    return X, y
+    for i in range(len(days) - win):
+        past = days[i:i+win]
+        nxt  = days[i+win]
+        x = np.concatenate([day_to_vector_54(d["all_last2"]) for d in past], axis=0)
+        X.append(x)
+        y.append(digits_to_vector(nxt["gdb_last2"]))
+    return np.stack(X, 0), np.stack(y, 0)
+
+# -------- model --------
 
 def build_model(input_dim):
     model = keras.Sequential([
         layers.Input(shape=(input_dim,)),
+        layers.Dense(256, activation='relu'),
         layers.Dense(128, activation='relu'),
         layers.Dense(64, activation='relu'),
-        layers.Dense(5, activation='sigmoid')  # 0..1 -> *9 -> round
+        layers.Dense(2, activation='sigmoid')  # predict 2 digits scaled 0..1
     ])
-    model.compile(optimizer='adam', loss='mae')  # MAE ổn hơn với digit rounding
+    model.compile(optimizer='adam', loss='mae')
     return model
 
 def export_tflite(model):
@@ -81,24 +144,27 @@ def export_tflite(model):
     OUT_MODEL.write_bytes(tflite_model)
 
 def sha256(p: Path) -> str:
-    import hashlib
     h = hashlib.sha256(); h.update(p.read_bytes()); return h.hexdigest()
 
 def main():
-    series = scrape(400)
-    if len(series) < 30:
+    raw = scrape_days(400)              # newest -> oldest
+    if len(raw) < 40:
         print("Not enough data scraped"); sys.exit(1)
 
-    X, y = make_supervised(series, win=7)  # 7 ngày -> ngày sau
+    # chuyển thành oldest->newest cho sliding
+    days = list(reversed(raw))
+
+    X, y = make_supervised(days, win=7)  # win=7 days context
     n = len(X)
     idx = np.arange(n); np.random.shuffle(idx)
-    split = int(n*0.85)
+    split = int(n * 0.85)
     tr, va = idx[:split], idx[split:]
     Xtr, ytr, Xva, yva = X[tr], y[tr], X[va], y[va]
 
-    model = build_model(X.shape[1])
-    cb = keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True)
-    model.fit(Xtr, ytr, validation_data=(Xva, yva), epochs=80, batch_size=32, verbose=0, callbacks=[cb])
+    model = build_model(X.shape[1])     # 7*54 = 378
+    cb = keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)
+    model.fit(Xtr, ytr, validation_data=(Xva, yva),
+              epochs=120, batch_size=64, verbose=0, callbacks=[cb])
 
     export_tflite(model)
 
