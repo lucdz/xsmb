@@ -1,6 +1,7 @@
 # train_model.py — predict 10 candidates of last-2 digits of GĐB
 import re, json, hashlib, datetime, sys, time, random
 from pathlib import Path
+
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -12,13 +13,7 @@ from tensorflow.keras import layers
 random.seed(42); np.random.seed(42); tf.random.set_seed(42)
 
 OUT_MODEL = Path("model.tflite")
-commit = os.environ.get("GITHUB_SHA", "main")  # Actions tự set biến này
-ver = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M")
-OUT_VERSION.write_text(json.dumps({
-    "version": ver,
-    "url": f"https://cdn.jsdelivr.net/gh/lucdz/xsmb@{commit}/model.tflite",
-    "sha256": sha256(OUT_MODEL)
-}, ensure_ascii=False, indent=2), encoding="utf-8")
+OUT_VERSION = Path("version.json")
 UA = {"User-Agent": "Mozilla/5.0 (XSMB-TrainingBot/3.0)"}
 
 # -------------------- scraping --------------------
@@ -196,6 +191,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
