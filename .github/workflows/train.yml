@@ -1,9 +1,9 @@
-name: Train and publish model
+name: Train XSMB model
 
 on:
+  workflow_dispatch: {}
   schedule:
     - cron: '45 11 * * *'   # 18:45 VN = 11:45 UTC
-  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -13,31 +13,84 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # DÙNG PYTHON 3.10 cho ổn định với TF 2.14
-      - name: Set up Python
+      - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install deps (pin numpy 1.26.4)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install "numpy==1.26.4"
-          pip install --no-cache-dir "tensorflow-cpu==2.14.0"
+          pip install numpy==1.26.4
+          pip install --no-cache-dir tensorflow-cpu==2.14.0
           pip install --no-cache-dir requests beautifulsoup4 lxml
-
-      - name: Show versions
-        run: |
-          python -c "import sys, numpy, tensorflow as tf; print(sys.version); print('numpy', numpy.__version__); print('tf', tf.__version__)"
 
       - name: Train & export
         run: python train_model.py
 
-      - name: Commit model & version.json
+      - name: Verify TFLite output shape is 100
         run: |
-          git config user.name "github-actions[bot]"
+          python - <<'PY'
+          import tensorflow as tf
+          i=tf.lite.Interpreter(model_path="model.tflite"); i.allocate_tensors()
+          shape = i.get_output_details()[0]['shape']
+          print("OUTPUT_SHAPE:", shape)
+          # Cho phép dynamic hàng [N,100]; nhưng cột phải là 100
+          ok = (len(shape)==2 and shape[1]==100) or (len(shape)==1 and shape[0]==100)
+          assert ok, f"Expect *x100, got {shape}"
+          PY
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add model.tflite version.json
-          git commit -m "auto: update model" || echo "Nothing to commit"
-          git push
+
+      # 1) Commit & push model.tflite trước
+      - name: Commit & push model.tflite
+        run: |
+          set -e
+          git add -f model.tflite
+          git commit -m "model: update $(date -u +'%Y-%m-%dT%H:%MZ')" || echo "No changes in model.tflite"
+          git push || true
+
+      # 2) Lấy SHA commit chứa model.tflite
+      - name: Determine model commit SHA
+        id: modelsha
+        run: |
+          SHA=$(git rev-list -n 1 HEAD -- model.tflite)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Model commit: $SHA"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # 3) Ghi đè version.json.url trỏ về đúng SHA ở trên
+      - name: Rewrite version.json URL to pinned commit
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          SHA="${{ steps.modelsha.outputs.sha }}"
+          tmp=$(mktemp)
+          jq --arg url "https://cdn.jsdelivr.net/gh/$REPO@$SHA/model.tflite" '.url=$url' version.json > "$tmp"
+          mv "$tmp" version.json
+          cat version.json
+
+      # 4) Commit & push version.json
+      - name: Commit & push version.json
+        run: |
+          set -e
+          git add version.json
+          git commit -m "version: point to ${{ steps.modelsha.outputs.sha }}" || echo "No changes in version.json"
+          git push || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xsmb-model-${{ github.run_number }}
+          path: |
+            model.tflite
+            version.json
+          retention-days: 7
