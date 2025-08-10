@@ -182,16 +182,14 @@ def main():
     export_tflite(model)
 
     ver = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M")
+    commit = os.environ.get("GITHUB_SHA", "main")  # <-- lấy SHA của workflow hiện tại
+
     OUT_VERSION.write_text(json.dumps({
-        "version": ver,
-        "url": "https://cdn.jsdelivr.net/gh/lucdz/xsmb@main/model.tflite",
-        "sha256": sha256(OUT_MODEL)
+    "version": ver,
+    "url": f"https://cdn.jsdelivr.net/gh/lucdz/xsmb@{commit}/model.tflite",  # <-- KHÔNG dùng @main
+    "sha256": sha256(OUT_MODEL)
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print("OK", ver)
 
 if __name__ == "__main__":
     main()
-
-
-
-
