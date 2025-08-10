@@ -134,22 +134,22 @@ def make_supervised(days, win=7):
         past = days[i:i+win]
         nxt  = days[i+win]
         X.append(np.concatenate([day_to_vec54(d["all_last2"]) for d in past], 0))  # 378
-        y.append(np.array([int(nxt["gdb_last2"][0]), int(nxt["gdb_last2"][1])], np.float32) / 9.0)
-    return np.stack(X, 0), np.stack(y, 0)
+        y.append(int(nxt["gdb_last2"]))  # "07" -> 7 ; "36" -> 36
+    return np.stack(X, 0), np.array(y, np.int32)
 
 # -------------------- model --------------------
 
 def build_model(input_dim):
-    # output 20 (10 cặp)
     model = keras.Sequential([
         layers.Input(shape=(input_dim,)),
         layers.Dense(256, activation='relu'),
         layers.Dense(128, activation='relu'),
         layers.Dense(64, activation='relu'),
-        layers.Dense(20, activation='sigmoid')
+        layers.Dense(100, activation='softmax')   # 00..99
     ])
-    model.compile(optimizer='adam', loss='mae')
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
+
 
 def export_tflite(model):
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
@@ -167,17 +167,16 @@ def main():
     X, y = make_supervised(days, win=7) # y shape (N,2)
 
     # >>> NEW: mở rộng nhãn (N,2) -> (N,20) bằng cách lặp lại 10 lần
-    y20 = np.concatenate([y] * 10, axis=1)
+    # y20 = np.concatenate([y] * 10, axis=1)
 
     if len(X) < 30:
         print("Not enough supervised samples (<30). Abort."); sys.exit(1)
 
-    print(f"[dataset] X:{X.shape} y:{y.shape} -> y20:{y20.shape}")  # ví dụ: y20:(N,20)
+    print(f"[dataset] X:{X.shape} y:{y.shape}")  # ví dụ: y20:(N,20)
 
     model = build_model(X.shape[1])     # output 20
     cb = keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)
-    model.fit(X, y20, validation_split=0.15,
-              epochs=120, batch_size=64, verbose=0, callbacks=[cb])
+    model.fit(X, y, validation_split=0.15, epochs=120, batch_size=64, verbose=0, callbacks=[cb])
 
     export_tflite(model)
 
@@ -191,4 +190,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
