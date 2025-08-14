@@ -176,6 +176,18 @@ def find_temperature(logits, y, grid=np.linspace(0.5, 3.0, 41)):
             bestLoss, bestT = nll, T
     return float(bestT)
 
+def sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.05):
+    """Loss cho nhãn sparse nhưng có label smoothing."""
+    if epsilon <= 0:
+        return tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    cce = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
+    def loss_fn(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        y_one  = tf.one_hot(y_true, num_classes)
+        y_smooth = y_one * (1.0 - epsilon) + (epsilon / num_classes)
+        return cce(y_smooth, y_pred)
+    return loss_fn
+
 # ---------- main ----------
 def main():
     raw = scrape_days(1500)
@@ -189,7 +201,15 @@ def main():
     split = int(len(X)*0.85)
 
     model = build_model(X.shape[1])
-    loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True, label_smoothing=0.05)
+
+    # NEW
+    loss = sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.05)
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-3),
+        loss=loss,
+        metrics=[tf.keras.metrics.SparseTopKCategoricalAccuracy(k=10, name="top10")]
+    )
+
     model.compile(
         optimizer=keras.optimizers.Adam(1e-3),
         loss=loss,
@@ -233,3 +253,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
