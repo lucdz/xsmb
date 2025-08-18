@@ -39,7 +39,7 @@ def fetch_html(url, retries=5, timeout=20):
             last=e; time.sleep(2**i)
     raise last
 def id_to_iso(id_str):
-    m=re.search(r'(\d{2})(\d{2})(\d{4})$', id_str or ""); 
+    m=re.search(r'(\d{2})(\d{2})(\d{4})$', id_str or "")
     return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else None
 def ddmmyyyy_to_iso(ddmmyyyy):
     m=re.match(r'(\d{2})-(\d{2})-(\d{4})$', ddmmyyyy or "")
@@ -68,9 +68,9 @@ def parse_table(tbl):
                 g = last2(vals[0])
                 if g: gdb_last2 = g
 
-    if not gdb_last2 or len(all_last2) < 20: return None
-    if len(all_last2) < 27: all_last2 += ["00"]*(27-len(all_last2))
-    elif len(all_last2) > 27: all_last2 = all_last2[:27]
+    # chỉ nhận mẫu sạch: đủ 27 số & có GĐB  (FIX: thụt lề)
+    if not gdb_last2 or len(all_last2) != 27:
+        return None
     return {"all_last2": all_last2, "gdb_last2": gdb_last2}
 
 def scrape_days(max_days=1500):  # ~4+ năm
@@ -110,7 +110,7 @@ def scrape_days(max_days=1500):  # ~4+ năm
     return out
 
 def day_to_vec54(all_last2):
-    a=[]; 
+    a=[]
     for s in all_last2: a.extend([int(s[0]), int(s[1])])
     return (np.array(a, np.float32) / 9.0)
 
@@ -137,13 +137,13 @@ def build_model(input_dim):
     inp = keras.Input(shape=(input_dim,), name="flat378")
     x = layers.Reshape((7,27,2), name="reshape_7x27x2")(inp)
 
-    x = conv_block(x, 32)                           # local pattern
+    x = conv_block(x, 32)
     x = conv_block(x, 32, dw=True)
-    x = layers.MaxPooling2D(pool_size=(1,3))(x)     # nén theo trục 27
+    x = layers.MaxPooling2D(pool_size=(1,3))(x)
 
     x = conv_block(x, 48)
     x = conv_block(x, 64, dw=True)
-    x = layers.MaxPooling2D(pool_size=(2,1))(x)     # nén theo trục 7 ngày
+    x = layers.MaxPooling2D(pool_size=(2,1))(x)
 
     x = conv_block(x, 64)
     x = conv_block(x, 96, dw=True)
@@ -151,7 +151,7 @@ def build_model(input_dim):
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.25)(x)
     x = layers.Dense(128, activation="relu", kernel_regularizer=reg)(x)
-    logits = layers.Dense(100, activation=None, name="logits")(x)  # <-- logits 100 lớp
+    logits = layers.Dense(100, activation=None, name="logits")(x)
 
     return keras.Model(inp, logits, name="xsmb_cnn")
 
@@ -159,7 +159,7 @@ def export_tflite(model):
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     OUT_MODEL.write_bytes(converter.convert())
 
-def sha256(p): 
+def sha256(p):
     h=hashlib.sha256(); h.update(p.read_bytes()); return h.hexdigest()
 
 def softmax(z):
@@ -177,7 +177,6 @@ def find_temperature(logits, y, grid=np.linspace(0.5, 3.0, 41)):
     return float(bestT)
 
 def sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.05):
-    """Loss cho nhãn sparse nhưng có label smoothing."""
     if epsilon <= 0:
         return tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     cce = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
@@ -191,30 +190,32 @@ def sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.05):
 # ---------- main ----------
 def main():
     raw = scrape_days(1500)
+    print("[scrape] days:", len(raw))
     if len(raw) < 80: raise SystemExit("Too few days scraped.")
     days = sorted(raw, key=lambda d: d["date"])  # oldest -> newest
 
     X, y = make_supervised(days, win=7)
     if len(X) < 80: raise SystemExit("Too few samples.")
-
     print(f"[dataset] X:{X.shape} y:{y.shape}")
+
+    # FIX: khai báo split TRƯỚC khi dùng
     split = int(len(X)*0.85)
+
+    # ---- thống kê & weight lớp để giảm thiên lệch
+    hist_train = np.bincount(y[:split], minlength=100).astype(np.float32)
+    w = hist_train.mean() / np.maximum(hist_train, 1.0)   # mean / freq
+    class_weight = {i: float(w[i]) for i in range(100)}
+    print("[label_hist] min/max:", hist_train.min(), hist_train.max())
 
     model = build_model(X.shape[1])
 
-    # NEW
-    loss = sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.05)
+    loss = sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.01)
     model.compile(
         optimizer=keras.optimizers.Adam(1e-3),
         loss=loss,
         metrics=[tf.keras.metrics.SparseTopKCategoricalAccuracy(k=10, name="top10")]
     )
 
-    model.compile(
-        optimizer=keras.optimizers.Adam(1e-3),
-        loss=loss,
-        metrics=[tf.keras.metrics.SparseTopKCategoricalAccuracy(k=10, name="top10")]
-    )
     cbs = [
         keras.callbacks.ReduceLROnPlateau(patience=6, factor=0.5, min_lr=5e-5, verbose=1),
         keras.callbacks.EarlyStopping(patience=14, restore_best_weights=True, verbose=1)
@@ -222,7 +223,8 @@ def main():
     model.fit(
         X[:split], y[:split],
         validation_data=(X[split:], y[split:]),
-        epochs=200, batch_size=256, shuffle=False, callbacks=cbs, verbose=2
+        epochs=200, batch_size=256, shuffle=False, callbacks=cbs, verbose=2,
+        class_weight=class_weight
     )
 
     # calibration
@@ -253,4 +255,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
