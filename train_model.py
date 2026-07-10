@@ -8,6 +8,19 @@ train_model.py — CNN (7×27×2) + calibration, output 100 lớp.
 - Label smoothing + EarlyStopping + ReduceLROnPlateau
 - Temperature scaling (calibration) trước khi xuất TFLite
 - Input TFLite vẫn là [1, 378] float32 (app KHÔNG cần đổi)
+
+CẬP NHẬT (fix job fail liên tục + chạy ~1 tiếng rồi mới báo lỗi trên GitHub Actions):
+1) Cache lịch sử vào data/xsmb_history.json — mỗi lần chạy chỉ scrape thêm vài
+   ngày MỚI thay vì dò lại toàn bộ lịch sử từ đầu mỗi ngày.
+   => Workflow .yml cần thêm bước commit lại file cache này sau khi chạy, xem
+      ghi chú cuối file, nếu không cache sẽ mất giữa các lần chạy.
+2) Log chi tiết HTTP status / có tìm thấy table hay không -> biết chính xác
+   chỗ nào fail nếu vẫn lỗi (thay vì phải đoán).
+3) Fail-fast: nếu 10 lần scrape liên tiếp đều fail thì dừng ngay (vài giây)
+   thay vì cố chạy hết rồi mới báo lỗi sau ~1 tiếng.
+4) User-Agent giống trình duyệt thật thay vì tự khai "...TrainingBot..."
+   (chuỗi cũ rất dễ bị WAF/Cloudflare nhận diện là bot).
+5) Có delay nhỏ giữa các request.
 """
 
 import os, re, json, hashlib, time, random, datetime as dt
@@ -23,27 +36,54 @@ random.seed(42); np.random.seed(42); tf.random.set_seed(42)
 
 OUT_MODEL   = Path("model.tflite")
 OUT_VERSION = Path("version.json")
-UA = {"User-Agent": "Mozilla/5.0 (XSMB-TrainingBot/5.0)"}
+CACHE_FILE  = Path("data/xsmb_history.json")   # MỚI: lịch sử được giữ lại giữa các lần chạy
+
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
 BASE_LIST_URL = "https://xosodaiphat.com/xsmb-xo-so-mien-bac.html"
 DAY_URL_TPL   = "https://xosodaiphat.com/xsmb-{ddmmyyyy}.html"
 
+REQUEST_DELAY     = 0.35  # giây, nghỉ giữa các request để đỡ bị nghi là bot
+STOP_AFTER_KNOWN  = 5     # gặp liên tiếp N ngày đã có trong cache -> coi như bắt kịp lịch sử
+FAIL_FAST_AFTER   = 10    # N lần scrape liên tiếp đều fail -> dừng sớm luôn
+
 # ---------- helpers ----------
-def last2(s): s=re.sub(r"\D","",s or ""); return s[-2:] if len(s)>=2 else None
+def last2(s):
+    s = re.sub(r"\D", "", s or "")
+    return s[-2:] if len(s) >= 2 else None
+
 def fetch_html(url, retries=5, timeout=20):
-    last=None
+    last = None
     for i in range(retries):
         try:
-            r=requests.get(url, headers=UA, timeout=timeout); r.raise_for_status(); return r.text
+            r = requests.get(url, headers=UA, timeout=timeout)
+            print(f"[fetch] {url} -> HTTP {r.status_code} ({len(r.content)} bytes)")
+            r.raise_for_status()
+            return r.text
         except Exception as e:
-            last=e; time.sleep(2**i)
+            last = e
+            print(f"[fetch] lỗi lần {i+1}/{retries} tại {url}: {e}")
+            time.sleep(2 ** i)
     raise last
-def id_to_iso(id_str):
-    m=re.search(r'(\d{2})(\d{2})(\d{4})$', id_str or "")
-    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else None
-def ddmmyyyy_to_iso(ddmmyyyy):
-    m=re.match(r'(\d{2})-(\d{2})-(\d{4})$', ddmmyyyy or "")
-    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else None
+
+# ---------- cache lịch sử (MỚI) ----------
+def load_cache():
+    if not CACHE_FILE.exists():
+        print(f"[cache] không thấy {CACHE_FILE}, bắt đầu từ rỗng")
+        return []
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        print(f"[cache] đã load {len(data)} ngày từ {CACHE_FILE}")
+        return data
+    except Exception as e:
+        print(f"[cache] lỗi đọc cache ({e}), bỏ qua và bắt đầu từ rỗng")
+        return []
+
+def save_cache(days):
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(days, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[cache] đã lưu {len(days)} ngày vào {CACHE_FILE}")
 
 def parse_table(tbl):
     all_last2, gdb_last2 = [], None
@@ -68,62 +108,92 @@ def parse_table(tbl):
                 g = last2(vals[0])
                 if g: gdb_last2 = g
 
-    # chỉ nhận mẫu sạch: đủ 27 số & có GĐB  (FIX: thụt lề)
+    # chỉ nhận mẫu sạch: đủ 27 số & có GĐB
     if not gdb_last2 or len(all_last2) != 27:
         return None
     return {"all_last2": all_last2, "gdb_last2": gdb_last2}
 
-def scrape_days(max_days=1500):  # ~4+ năm
-    out, seen = [], set()
-    # trang tổng
+def scrape_day(ddmmyyyy):
+    """Scrape đúng 1 ngày. Trả None nếu không lấy được / không hợp lệ (đã log lý do)."""
+    url = DAY_URL_TPL.format(ddmmyyyy=ddmmyyyy)
     try:
-        soup = BeautifulSoup(fetch_html(BASE_LIST_URL), "html.parser")
-        for blk in soup.select('div[id^="kqngay_"]'):
-            if len(out) >= max_days: break
-            tbl = blk.select_one("table.table-xsmb")
-            if not tbl: continue
-            parsed = parse_table(tbl)
-            d_iso = id_to_iso(blk.get("id", ""))
-            if parsed and d_iso and d_iso not in seen:
-                parsed["date"] = d_iso; out.append(parsed); seen.add(d_iso)
+        soup = BeautifulSoup(fetch_html(url), "html.parser")
+        tbl = soup.select_one("table.table-xsmb")
+        if not tbl:
+            print(f"[scrape] KHÔNG thấy table.table-xsmb tại {url} (site đổi cấu trúc hoặc bị chặn?)")
+            return None
+        parsed = parse_table(tbl)
+        if not parsed:
+            print(f"[scrape] có table nhưng parse thiếu (không đủ 27 số / thiếu G.ĐB): {url}")
+        return parsed
     except Exception as e:
-        print(f"[scrape] base page failed: {e}")
+        print(f"[scrape] skip {url}: {e}")
+        return None
 
-    # từng ngày lùi dần
+def scrape_incremental(existing_days, max_days=1500, max_new=45):
+    """
+    Đi lùi từ hôm nay, CHỈ scrape những ngày chưa có trong cache.
+    Dừng sớm khi:
+      - gặp liên tiếp STOP_AFTER_KNOWN ngày đã có sẵn (bắt kịp lịch sử), hoặc
+      - đã lấy đủ max_new ngày mới, hoặc
+      - FAIL_FAST_AFTER lần scrape liên tiếp đều fail (site chặn / đổi cấu trúc),
+        để job fail nhanh trong vài giây thay vì chạy hết rồi mới báo lỗi.
+    """
+    seen = {d["date"] for d in existing_days}
+    out = []
+    attempted = 0
     today = dt.date.today()
-    for i in range(1, 4000):
-        if len(out) >= max_days: break
-        ddmmyyyy = (today - dt.timedelta(days=i)).strftime("%d-%m-%Y")
-        d_iso = ddmmyyyy_to_iso(ddmmyyyy)
-        if d_iso in seen: continue
-        url = DAY_URL_TPL.format(ddmmyyyy=ddmmyyyy)
-        try:
-            soup = BeautifulSoup(fetch_html(url), "html.parser")
-            tbl = soup.select_one("table.table-xsmb")
-            if not tbl: continue
-            parsed = parse_table(tbl)
-            if parsed:
-                parsed["date"] = d_iso; out.append(parsed); seen.add(d_iso)
-        except Exception as e:
-            print(f"[scrape] skip {url}: {e}")
-    print(f"[scrape] total unique days: {len(out)}")
+    consecutive_known = 0
+
+    for i in range(max_days):
+        d_date = today - dt.timedelta(days=i)
+        d_iso = d_date.isoformat()
+
+        if d_iso in seen:
+            consecutive_known += 1
+            if consecutive_known >= STOP_AFTER_KNOWN:
+                print(f"[scrape] đã bắt kịp lịch sử quanh {d_iso}, dừng dò thêm")
+                break
+            continue
+        consecutive_known = 0
+
+        if len(out) >= max_new:
+            print(f"[scrape] đã đạt giới hạn {max_new} ngày mới cho lần chạy này, dừng lại")
+            break
+
+        parsed = scrape_day(d_date.strftime("%d-%m-%Y"))
+        attempted += 1
+        if parsed:
+            parsed["date"] = d_iso
+            out.append(parsed)
+            print(f"[scrape] OK {d_iso} (mới lấy được: {len(out)})")
+        elif attempted >= FAIL_FAST_AFTER and len(out) == 0:
+            print(f"[scrape] {attempted} lần scrape liên tiếp đều fail -> dừng sớm. "
+                  f"Kiểm tra log [fetch]/[scrape] phía trên (HTTP status? "
+                  f"table.table-xsmb có tồn tại không? site đổi cấu trúc hay chặn IP/UA?)")
+            break
+
+        time.sleep(REQUEST_DELAY)
+
+    print(f"[scrape] tổng số ngày MỚI lấy được lần này: {len(out)}")
     return out
 
 def day_to_vec54(all_last2):
-    a=[]
-    for s in all_last2: a.extend([int(s[0]), int(s[1])])
-    return (np.array(a, np.float32) / 9.0)
+    a = []
+    for s in all_last2:
+        a.extend([int(s[0]), int(s[1])])
+    return np.array(a, np.float32) / 9.0
 
 def make_supervised(days, win=7):
     X, y = [], []
-    for i in range(len(days)-win):
-        past = days[i:i+win]; nxt=days[i+win]
+    for i in range(len(days) - win):
+        past = days[i:i+win]; nxt = days[i+win]
         X.append(np.concatenate([day_to_vec54(d["all_last2"]) for d in past], axis=0))  # (378,)
         y.append(int(nxt["gdb_last2"]))
-    return np.stack(X,0), np.array(y, np.int32)
+    return np.stack(X, 0), np.array(y, np.int32)
 
-# ---------- model ----------
-def conv_block(x, f, k=(3,3), dw=False, name=None):
+# ---------- model (giữ nguyên) ----------
+def conv_block(x, f, k=(3, 3), dw=False, name=None):
     if dw:
         x = layers.SeparableConv2D(f, k, padding="same", activation=None, name=name)(x)
     else:
@@ -135,15 +205,15 @@ def conv_block(x, f, k=(3,3), dw=False, name=None):
 def build_model(input_dim):
     reg = keras.regularizers.l2(1e-5)
     inp = keras.Input(shape=(input_dim,), name="flat378")
-    x = layers.Reshape((7,27,2), name="reshape_7x27x2")(inp)
+    x = layers.Reshape((7, 27, 2), name="reshape_7x27x2")(inp)
 
     x = conv_block(x, 32)
     x = conv_block(x, 32, dw=True)
-    x = layers.MaxPooling2D(pool_size=(1,3))(x)
+    x = layers.MaxPooling2D(pool_size=(1, 3))(x)
 
     x = conv_block(x, 48)
     x = conv_block(x, 64, dw=True)
-    x = layers.MaxPooling2D(pool_size=(2,1))(x)
+    x = layers.MaxPooling2D(pool_size=(2, 1))(x)
 
     x = conv_block(x, 64)
     x = conv_block(x, 96, dw=True)
@@ -160,11 +230,14 @@ def export_tflite(model):
     OUT_MODEL.write_bytes(converter.convert())
 
 def sha256(p):
-    h=hashlib.sha256(); h.update(p.read_bytes()); return h.hexdigest()
+    h = hashlib.sha256()
+    h.update(p.read_bytes())
+    return h.hexdigest()
 
 def softmax(z):
-    z=z - np.max(z, axis=1, keepdims=True)
-    e=np.exp(z); return e/np.sum(e, axis=1, keepdims=True)
+    z = z - np.max(z, axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / np.sum(e, axis=1, keepdims=True)
 
 def find_temperature(logits, y, grid=np.linspace(0.5, 3.0, 41)):
     bestT, bestLoss = 1.0, 1e9
@@ -182,24 +255,44 @@ def sparse_ce_with_label_smoothing(num_classes=100, epsilon=0.05):
     cce = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
     def loss_fn(y_true, y_pred):
         y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
-        y_one  = tf.one_hot(y_true, num_classes)
+        y_one = tf.one_hot(y_true, num_classes)
         y_smooth = y_one * (1.0 - epsilon) + (epsilon / num_classes)
         return cce(y_smooth, y_pred)
     return loss_fn
 
 # ---------- main ----------
 def main():
-    raw = scrape_days(1500)
-    print("[scrape] days:", len(raw))
-    if len(raw) < 80: raise SystemExit("Too few days scraped.")
-    days = sorted(raw, key=lambda d: d["date"])  # oldest -> newest
+    existing = load_cache()
+
+    # Cache còn mỏng (lần đầu chạy, hoặc mọi lần trước đều fail) -> cho phép dò sâu hơn.
+    # Cache đã đủ dày -> mỗi lần chỉ cần bắt thêm vài ngày mới nhất.
+    max_new = 1500 if len(existing) < 80 else 45
+    print(f"[main] cache hiện có {len(existing)} ngày -> max_new lần này = {max_new}")
+    new_days = scrape_incremental(existing, max_days=1500, max_new=max_new)
+
+    days_by_date = {d["date"]: d for d in existing}
+    for d in new_days:
+        days_by_date[d["date"]] = d
+    days = sorted(days_by_date.values(), key=lambda d: d["date"])
+    print(f"[dataset] tổng số ngày sau khi merge cache: {len(days)}")
+
+    # Lưu cache NGAY, trước khi train — để nếu bước train phía dưới lỗi,
+    # dữ liệu vừa scrape được vẫn không bị mất cho lần chạy sau.
+    save_cache(days)
+
+    if len(days) < 80:
+        raise SystemExit(
+            f"Too few days scraped/cached ({len(days)}). "
+            f"Xem log [fetch]/[scrape] phía trên để biết chính xác lý do "
+            f"(HTTP status, có tìm thấy table.table-xsmb không...)."
+        )
 
     X, y = make_supervised(days, win=7)
-    if len(X) < 80: raise SystemExit("Too few samples.")
+    if len(X) < 80:
+        raise SystemExit("Too few samples.")
     print(f"[dataset] X:{X.shape} y:{y.shape}")
 
-    # FIX: khai báo split TRƯỚC khi dùng
-    split = int(len(X)*0.85)
+    split = int(len(X) * 0.85)
 
     # ---- thống kê & weight lớp để giảm thiên lệch
     hist_train = np.bincount(y[:split], minlength=100).astype(np.float32)
