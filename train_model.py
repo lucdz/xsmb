@@ -21,6 +21,13 @@ CẬP NHẬT (fix job fail liên tục + chạy ~1 tiếng rồi mới báo lỗ
 4) User-Agent giống trình duyệt thật thay vì tự khai "...TrainingBot..."
    (chuỗi cũ rất dễ bị WAF/Cloudflare nhận diện là bot).
 5) Có delay nhỏ giữa các request.
+6) FIX GỐC RỄ (phát hiện từ log run #112): table.table-xsmb vẫn tồn tại và
+   fetch OK (HTTP 200), nhưng parse_table cũ dùng re.split để tách số trong
+   mỗi giải — trong khi site hiện nối các số trong CÙNG 1 giải dính liền
+   nhau không dấu cách (vd G.7 "99350386" = 4 số 2 chữ số, không phải 1 số
+   8 chữ số). Sửa lại: cắt theo ĐỘ DÀI CỐ ĐỊNH của từng giải (G.ĐB/G.1/G.2/
+   G.3=5, G.4/G.5=4, G.6=3, G.7=2). Có debug in chi tiết 2 trang đầu mỗi lần
+   chạy để phát hiện sớm nếu site đổi định dạng lần nữa.
 """
 
 import os, re, json, hashlib, time, random, datetime as dt
@@ -85,33 +92,74 @@ def save_cache(days):
     CACHE_FILE.write_text(json.dumps(days, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[cache] đã lưu {len(days)} ngày vào {CACHE_FILE}")
 
-def parse_table(tbl):
+# XSMB: mỗi giải có ĐỘ DÀI CỐ ĐỊNH cho mỗi số (site nối các số trong cùng 1 giải
+# dính liền nhau, KHÔNG có dấu cách/span riêng — vd G.7 có 4 số 2 chữ số hiện thành
+# 1 chuỗi 8 chữ số "99350386" chứ không phải 4 span tách rời). Do đó cách đúng là
+# cắt chuỗi số theo đúng độ dài mỗi giải, không phải re.split theo ký tự phân cách.
+_TIER_PATTERNS = [
+    ("gdb", re.compile(r"g\s*\.?\s*đ\s*b|giải\s*đặc\s*biệt"), 5),
+    ("g1",  re.compile(r"g\s*\.?\s*1\b"), 5),
+    ("g2",  re.compile(r"g\s*\.?\s*2\b"), 5),
+    ("g3",  re.compile(r"g\s*\.?\s*3\b"), 5),
+    ("g4",  re.compile(r"g\s*\.?\s*4\b"), 4),
+    ("g5",  re.compile(r"g\s*\.?\s*5\b"), 4),
+    ("g6",  re.compile(r"g\s*\.?\s*6\b"), 3),
+    ("g7",  re.compile(r"g\s*\.?\s*7\b"), 2),
+]
+
+def match_tier(key):
+    for name, pat, width in _TIER_PATTERNS:
+        if pat.search(key):
+            return name, width
+    return None, None
+
+def parse_table(tbl, debug=False):
     all_last2, gdb_last2 = [], None
     for tr in tbl.select("tbody > tr"):
         tds = tr.find_all("td")
         if len(tds) < 2: continue
         key = (tds[0].get_text(strip=True) or "").lower()
-        spans = [s.get_text(strip=True) for s in tds[1].select("span")]
-        vals = spans if spans else re.split(r"[^0-9]+", tds[1].get_text(" ", strip=True))
-        vals = [v for v in vals if v]
+        if "mã" in key:
+            continue
 
-        if "mã" not in key:
-            for v in vals:
-                l2 = last2(v)
-                if l2: all_last2.append(l2)
+        tier, width = match_tier(key)
+        if tier is None:
+            if debug:
+                print(f"[parse] key={key!r} không khớp giải nào đã biết -> bỏ qua hàng")
+            continue
 
-        if "mã" not in key and (
-            "g.đb" in key or "g đb" in key or "giải đặc biệt" in key
-            or "gdb" in key or re.search(r"g\s*\.\s*đb", key)
-        ):
-            if vals:
-                g = last2(vals[0])
-                if g: gdb_last2 = g
+        raw_text = tds[1].get_text(" ", strip=True)
+        digits = re.sub(r"\D", "", raw_text)
+
+        if digits and len(digits) % width == 0:
+            vals = [digits[i:i+width] for i in range(0, len(digits), width)]
+        else:
+            # dự phòng: nếu độ dài không chia hết (format khác dự kiến), thử theo
+            # span (nếu có) hoặc tách theo dấu phân cách như cách cũ
+            spans = [s.get_text(strip=True) for s in tds[1].select("span")]
+            vals = spans if spans else re.split(r"[^0-9]+", raw_text)
+            vals = [v for v in vals if v]
+
+        if debug:
+            print(f"[parse] key={key!r} tier={tier} width={width} digits_len={len(digits)} -> vals={vals}")
+
+        for v in vals:
+            l2 = last2(v)
+            if l2: all_last2.append(l2)
+
+        if tier == "gdb" and vals:
+            g = last2(vals[0])
+            if g: gdb_last2 = g
+
+    if debug:
+        print(f"[parse] tổng all_last2={len(all_last2)} gdb_last2={gdb_last2}")
 
     # chỉ nhận mẫu sạch: đủ 27 số & có GĐB
     if not gdb_last2 or len(all_last2) != 27:
         return None
     return {"all_last2": all_last2, "gdb_last2": gdb_last2}
+
+_DEBUG_PAGES_LEFT = [2]  # in chi tiết từng hàng cho 2 trang ĐẦU TIÊN mỗi lần chạy (theo dõi lâu dài)
 
 def scrape_day(ddmmyyyy):
     """Scrape đúng 1 ngày. Trả None nếu không lấy được / không hợp lệ (đã log lý do)."""
@@ -122,7 +170,11 @@ def scrape_day(ddmmyyyy):
         if not tbl:
             print(f"[scrape] KHÔNG thấy table.table-xsmb tại {url} (site đổi cấu trúc hoặc bị chặn?)")
             return None
-        parsed = parse_table(tbl)
+        debug = _DEBUG_PAGES_LEFT[0] > 0
+        if debug:
+            _DEBUG_PAGES_LEFT[0] -= 1
+            print(f"[scrape] --- debug chi tiết cho {url} ---")
+        parsed = parse_table(tbl, debug=debug)
         if not parsed:
             print(f"[scrape] có table nhưng parse thiếu (không đủ 27 số / thiếu G.ĐB): {url}")
         return parsed
