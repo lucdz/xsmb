@@ -115,7 +115,13 @@ def match_tier(key):
 
 def parse_table(tbl, debug=False):
     all_last2, gdb_last2 = [], None
-    for tr in tbl.select("tbody > tr"):
+    # LƯU Ý: dùng "tr" chứ không phải "tbody > tr" — HTML nguồn của site không có
+    # thẻ <tbody> tường minh (trình duyệt tự chèn lúc hiển thị, nhưng html.parser
+    # của bs4 thì không tự thêm), nên "tbody > tr" luôn khớp 0 hàng dù bảng vẫn có.
+    # Hàng lạ (vd header) vẫn an toàn vì match_tier() sẽ bỏ qua nếu không khớp giải nào.
+    if debug:
+        print(f"[parse] số hàng <tr> tìm được trong bảng: {len(tbl.select('tr'))}")
+    for tr in tbl.select("tr"):
         tds = tr.find_all("td")
         if len(tds) < 2: continue
         key = (tds[0].get_text(strip=True) or "").lower()
