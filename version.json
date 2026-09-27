@@ -1,5 +1,5 @@
 {
-  "version": "20260926-1506",
-  "url": "https://cdn.jsdelivr.net/gh/lucdz/xsmb@cf275edf9afebd41ab6fbb15a41930937f10e96b/model.tflite",
-  "sha256": "6a39417b08ca9056997fdbaf52a6b71582bfda08b123dd4e190abd47283e4087"
+  "version": "20260927-1549",
+  "url": "https://cdn.jsdelivr.net/gh/lucdz/xsmb@4fdddaab7eecff6e16aeac816a7a6986ddc6d180/model.tflite",
+  "sha256": "af6b50a93a88ec8e6bff5c5949825d31b75c31dc3d4a8536e0098be47c2514c8"
 }
